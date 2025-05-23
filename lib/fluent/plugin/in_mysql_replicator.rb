@@ -7,6 +7,7 @@ module Fluent::Plugin
     Fluent::Plugin.register_input('mysql_replicator', self)
 
     helpers :thread, :storage
+    DEFAULT_STORAGE_TYPE = 'local'
 
     config_param :host, :string, :default => 'localhost'
     config_param :port, :integer, :default => 3306
@@ -21,6 +22,13 @@ module Fluent::Plugin
     config_param :enable_delete, :bool, :default => true
     config_param :tag, :string, :default => nil
 
+    # Storage section for checkpoint data
+    config_section :storage do
+      config_set_default :usage, 'checkpoint'
+      config_set_default :@type, DEFAULT_STORAGE_TYPE
+      config_set_default :persistent, true
+    end
+
     def configure(conf)
       super
       @interval = Fluent::Config.time_value(@interval)
@@ -29,16 +37,17 @@ module Fluent::Plugin
         raise Fluent::ConfigError, "mysql_replicator: missing 'tag' parameter. Please add following line into config like 'tag replicator.mydatabase.mytable.${event}.${primary_key}'"
       end
 
+      @checkpoint = storage_create(usage: 'checkpoint')
+
       log.info "adding mysql_replicator worker. :tag=>#{tag} :query=>#{@query} :prepared_query=>#{@prepared_query} :interval=>#{@interval}sec :enable_delete=>#{enable_delete}"
     end
 
     def start
       super
-      @store = storage_create(usage: 'checkpoint')   # any usage label you like
 
       # Reload the last checkpoint (or start fresh)
-      @table_hash = @store['table_hash'] || {}
-      @ids        = @store['ids']        || []
+      @table_hash = @checkpoint.get(:table_hash) || {}
+      @ids        = @checkpoint.get(:ids) || []
 
       thread_create(:in_mysql_replicator_runner, &method(:run))
     end
@@ -126,9 +135,8 @@ module Fluent::Plugin
 
         # Persist checkpoint only when we actually emitted insert/update/delete events
         if changes_emitted
-          @store['table_hash'] = @table_hash
-          @store['ids']        = @ids
-          @store.save
+          @checkpoint.put(:table_hash, @table_hash)
+          @checkpoint.put(:ids, @ids)
         end
         
         # Sleep for the specified interval
