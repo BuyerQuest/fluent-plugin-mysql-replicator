@@ -6,7 +6,7 @@ module Fluent::Plugin
   class MysqlReplicatorInput < Fluent::Plugin::Input
     Fluent::Plugin.register_input('mysql_replicator', self)
 
-    helpers :thread
+    helpers :thread, :storage
 
     config_param :host, :string, :default => 'localhost'
     config_param :port, :integer, :default => 3306
@@ -34,6 +34,12 @@ module Fluent::Plugin
 
     def start
       super
+      @store = storage_create(usage: 'checkpoint')   # any usage label you like
+
+      # Reload the last checkpoint (or start fresh)
+      @table_hash = @store['table_hash'] || {}
+      @ids        = @store['ids']        || []
+
       thread_create(:in_mysql_replicator_runner, &method(:run))
     end
 
@@ -52,14 +58,13 @@ module Fluent::Plugin
     end
 
     def poll
-      table_hash = Hash.new
-      ids = Array.new
-      con = get_connection()
-      prepared_con = get_connection()
       loop do
+        con = get_connection()
+        prepared_con = get_connection()
+        changes_emitted = false
         rows_count = 0
         start_time = Time.now
-        previous_ids = ids
+        previous_ids = @ids.dup
         current_ids = Array.new
         if !@prepared_query.nil?
           @prepared_query.split(/;/).each do |query|
@@ -73,29 +78,32 @@ module Fluent::Plugin
           row.each {|k, v| row[k] = v.to_s if v.is_a?(Time) || v.is_a?(Date) || v.is_a?(BigDecimal)}
           row.select {|k, v| v.to_s.strip.match(/^SELECT(\s+)/i) }.each do |k, v|
             row[k] = [] unless row[k].is_a?(Array)
-            nest_rows, prepared_con = query(v.gsub(/\$\{([^\}]+)\}/, row[$1].to_s), prepared_con)
+            nested_sql = v.gsub(/\$\{([^\}]+)\}/) { row[Regexp.last_match(1)].to_s }
+            nest_rows, prepared_con = query(nested_sql, prepared_con)
             nest_rows.each do |nest_row|
               nest_row.each {|k, v| nest_row[k] = v.to_s if v.is_a?(Time) || v.is_a?(Date) || v.is_a?(BigDecimal)}
               row[k] << nest_row
             end
-            prepared_con.close
           end
           if row[@primary_key].nil?
             log.error "mysql_replicator: missing primary_key. :tag=>#{tag} :primary_key=>#{primary_key}"
             break
           end
-          if !table_hash.include?(row[@primary_key])
+          if !@table_hash.include?(row[@primary_key])
             tag = format_tag(@tag, {:event => :insert})
             emit_record(tag, row)
-          elsif table_hash[row[@primary_key]] != current_hash
+            changes_emitted = true
+          elsif @table_hash[row[@primary_key]] != current_hash
             tag = format_tag(@tag, {:event => :update})
             emit_record(tag, row)
+            changes_emitted = true
           end
-          table_hash[row[@primary_key]] = current_hash
+          @table_hash[row[@primary_key]] = current_hash
           rows_count += 1
         end
         con.close
-        ids = current_ids
+        prepared_con.close
+        @ids = current_ids
         if @enable_delete
           if current_ids.empty?
             deleted_ids = Array.new
@@ -105,15 +113,25 @@ module Fluent::Plugin
             deleted_ids = previous_ids - current_ids
           end
           if deleted_ids.count > 0
-            hash_delete_by_list(table_hash, deleted_ids)
+            hash_delete_by_list(@table_hash, deleted_ids)
             deleted_ids.each do |id|
               tag = format_tag(@tag, {:event => :delete})
               emit_record(tag, {@primary_key => id})
+              changes_emitted = true
             end
           end
         end
         elapsed_time = sprintf("%0.02f", Time.now - start_time)
-        log.info "mysql_replicator: finished execution :tag=>#{tag} :rows_count=>#{rows_count} :elapsed_time=>#{elapsed_time} sec"
+        log.info "mysql_replicator: finished execution :tag=>#{@tag} :rows_count=>#{rows_count} :elapsed_time=>#{elapsed_time} sec"
+
+        # Persist checkpoint only when we actually emitted insert/update/delete events
+        if changes_emitted
+          @store['table_hash'] = @table_hash
+          @store['ids']        = @ids
+          @store.save
+        end
+        
+        # Sleep for the specified interval
         sleep @interval
       end
     end
