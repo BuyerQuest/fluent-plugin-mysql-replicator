@@ -9,6 +9,9 @@ module Fluent::Plugin
     helpers :thread, :storage
     DEFAULT_STORAGE_TYPE = 'local'
 
+    # If the config does not include a <storage> section we simply keep
+    # state in‑memory and lose it on restart.
+
     config_param :host, :string, :default => 'localhost'
     config_param :port, :integer, :default => 3306
     config_param :username, :string, :default => 'root'
@@ -22,13 +25,6 @@ module Fluent::Plugin
     config_param :enable_delete, :bool, :default => true
     config_param :tag, :string, :default => nil
 
-    # Storage section for checkpoint data
-    config_section :storage do
-      config_set_default :usage, 'checkpoint'
-      config_set_default :@type, DEFAULT_STORAGE_TYPE
-      config_set_default :persistent, true
-    end
-
     def configure(conf)
       super
       @interval = Fluent::Config.time_value(@interval)
@@ -37,7 +33,15 @@ module Fluent::Plugin
         raise Fluent::ConfigError, "mysql_replicator: missing 'tag' parameter. Please add following line into config like 'tag replicator.mydatabase.mytable.${event}.${primary_key}'"
       end
 
-      @checkpoint = storage_create(usage: 'checkpoint')
+      # Create a storage backend only if the user actually provided one.
+      storage_conf = conf.elements(name: 'storage').first
+      if storage_conf
+        @checkpoint = storage_create(usage: 'checkpoint', conf: storage_conf,
+                                     default_type: DEFAULT_STORAGE_TYPE)
+      else
+        log.warn "mysql_replicator: no <storage> section found – state will NOT survive a restart."
+        @checkpoint = nil
+      end
 
       log.info "adding mysql_replicator worker. :tag=>#{tag} :query=>#{@query} :prepared_query=>#{@prepared_query} :interval=>#{@interval}sec :enable_delete=>#{enable_delete}"
     end
@@ -46,8 +50,22 @@ module Fluent::Plugin
       super
 
       # Reload the last checkpoint (or start fresh)
-      @table_hash = @checkpoint.get(:table_hash) || {}
-      @ids        = @checkpoint.get(:ids) || []
+      if @checkpoint
+        raw_hash = @checkpoint.get(:table_hash)
+        # Convert `[[k,v], ...]` back into {k=>v} if we stored an array
+        @table_hash = case raw_hash
+                      when Array
+                        raw_hash.to_h
+                      when Hash
+                        raw_hash
+                      else
+                        {}
+                      end
+        @ids = (@checkpoint.get(:ids) || [])
+      else
+        @table_hash = {}
+        @ids        = []
+      end
 
       thread_create(:in_mysql_replicator_runner, &method(:run))
     end
@@ -131,12 +149,15 @@ module Fluent::Plugin
           end
         end
         elapsed_time = sprintf("%0.02f", Time.now - start_time)
-        log.info "mysql_replicator: finished execution :tag=>#{@tag} :rows_count=>#{rows_count} :elapsed_time=>#{elapsed_time} sec"
+        log.debug "mysql_replicator: finished execution :tag=>#{@tag} :rows_count=>#{rows_count} :elapsed_time=>#{elapsed_time} sec"
 
         # Persist checkpoint only when we actually emitted insert/update/delete events
-        if changes_emitted
-          @checkpoint.put(:table_hash, @table_hash)
+        if changes_emitted && @checkpoint
+          # Store as array-of-pairs to preserve native key types in JSON/MessagePack
+          @checkpoint.put(:table_hash, @table_hash.map { |k, v| [k, v] })
           @checkpoint.put(:ids, @ids)
+          # ensure the data hits disk immediately
+          @checkpoint.save
         end
         
         # Sleep for the specified interval
